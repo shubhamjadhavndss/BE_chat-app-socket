@@ -22,13 +22,13 @@ app.use(cors());
 app.use(express.json());
 
 // MongoDB Connection
-mongoose.connect('mongodb://localhost:27017/chatapp', {
+mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/chatapp', {
     useNewUrlParser: true,
     useUnifiedTopology: true
 });
 
-// JWT Secret
-const JWT_SECRET = 'your-secret-key';
+// JWT Secret - Use environment variable
+const JWT_SECRET = process.env.JWT_SECRET || '01b266af359ffb49db8fe9f15330f083ad831b5de531555f929d6e4ad8342e3e2fdd72a5fbefd8b5d09eabdb049327b579066d153fddc1edb0419b78b014b098';
 
 // Socket.io connection handling
 const connectedUsers = new Map();
@@ -40,6 +40,12 @@ io.on('connection', (socket) => {
     socket.on('join', async (userData) => {
         try {
             const token = userData.token;
+            if (!token) {
+                console.log('No token provided');
+                socket.emit('authError', 'No token provided');
+                return;
+            }
+
             const decoded = jwt.verify(token, JWT_SECRET);
             const user = await User.findById(decoded.userId);
 
@@ -60,9 +66,21 @@ io.on('connection', (socket) => {
 
                 // Send online users list
                 socket.emit('onlineUsers', Array.from(connectedUsers.values()));
+
+                console.log(`User ${user.username} joined successfully`);
+            } else {
+                console.log('User not found');
+                socket.emit('authError', 'User not found');
             }
         } catch (error) {
-            console.error('Join error:', error);
+            console.error('Join error:', error.message);
+            if (error.name === 'JsonWebTokenError') {
+                socket.emit('authError', 'Invalid token');
+            } else if (error.name === 'TokenExpiredError') {
+                socket.emit('authError', 'Token expired');
+            } else {
+                socket.emit('authError', 'Authentication failed');
+            }
         }
     });
 
@@ -70,6 +88,11 @@ io.on('connection', (socket) => {
     socket.on('sendMessage', async (messageData) => {
         try {
             const { content, recipientId } = messageData;
+
+            if (!socket.userId) {
+                socket.emit('error', 'Not authenticated');
+                return;
+            }
 
             // Create message in database
             const message = new Message({
@@ -113,6 +136,10 @@ io.on('connection', (socket) => {
 
     // Handle typing indicators
     socket.on('typing', (data) => {
+        if (!socket.userId) {
+            return;
+        }
+
         const recipientUser = connectedUsers.get(data.recipientId);
         if (recipientUser) {
             io.to(recipientUser.socketId).emit('userTyping', {
@@ -144,6 +171,11 @@ app.post('/api/register', async (req, res) => {
     try {
         const { username, email, password } = req.body;
 
+        // Validate input
+        if (!username || !email || !password) {
+            return res.status(400).json({ error: 'All fields are required' });
+        }
+
         // Check if user exists
         const existingUser = await User.findOne({
             $or: [{ email }, { username }]
@@ -166,7 +198,7 @@ app.post('/api/register', async (req, res) => {
         await user.save();
 
         // Generate JWT
-        const token = jwt.sign({ userId: user._id }, JWT_SECRET);
+        const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '7d' });
 
         res.json({
             token,
@@ -177,6 +209,7 @@ app.post('/api/register', async (req, res) => {
             }
         });
     } catch (error) {
+        console.error('Registration error:', error);
         res.status(500).json({ error: 'Registration failed' });
     }
 });
@@ -184,6 +217,11 @@ app.post('/api/register', async (req, res) => {
 app.post('/api/login', async (req, res) => {
     try {
         const { username, password } = req.body;
+
+        // Validate input
+        if (!username || !password) {
+            return res.status(400).json({ error: 'Username and password are required' });
+        }
 
         // Find user
         const user = await User.findOne({ username });
@@ -198,7 +236,7 @@ app.post('/api/login', async (req, res) => {
         }
 
         // Generate JWT
-        const token = jwt.sign({ userId: user._id }, JWT_SECRET);
+        const token = jwt.sign({ userId: user._id }, JWT_SECRET, { expiresIn: '7d' });
 
         res.json({
             token,
@@ -209,36 +247,50 @@ app.post('/api/login', async (req, res) => {
             }
         });
     } catch (error) {
+        console.error('Login error:', error);
         res.status(500).json({ error: 'Login failed' });
     }
 });
 
-// Get users for chat
-app.get('/api/users', async (req, res) => {
+// Middleware to verify JWT
+const verifyToken = (req, res, next) => {
     try {
         const token = req.headers.authorization?.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
+        if (!token) {
+            return res.status(401).json({ error: 'No token provided' });
+        }
 
-        const users = await User.find({ _id: { $ne: decoded.userId } })
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.userId = decoded.userId;
+        next();
+    } catch (error) {
+        console.error('Token verification error:', error);
+        return res.status(401).json({ error: 'Invalid token' });
+    }
+};
+
+// Get users for chat
+app.get('/api/users', verifyToken, async (req, res) => {
+    try {
+        const users = await User.find({ _id: { $ne: req.userId } })
             .select('username email');
 
         res.json(users);
     } catch (error) {
+        console.error('Fetch users error:', error);
         res.status(500).json({ error: 'Failed to fetch users' });
     }
 });
 
 // Get messages between users
-app.get('/api/messages/:userId', async (req, res) => {
+app.get('/api/messages/:userId', verifyToken, async (req, res) => {
     try {
-        const token = req.headers.authorization?.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
         const { userId } = req.params;
 
         const messages = await Message.find({
             $or: [
-                { sender: decoded.userId, recipient: userId },
-                { sender: userId, recipient: decoded.userId }
+                { sender: req.userId, recipient: userId },
+                { sender: userId, recipient: req.userId }
             ]
         })
             .populate('sender', 'username')
@@ -246,11 +298,18 @@ app.get('/api/messages/:userId', async (req, res) => {
 
         res.json(messages);
     } catch (error) {
+        console.error('Fetch messages error:', error);
         res.status(500).json({ error: 'Failed to fetch messages' });
     }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
